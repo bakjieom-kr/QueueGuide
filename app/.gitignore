@@ -1,0 +1,18 @@
+/build
+
+# Build files
+.gradle/
+**/build/
+
+# Local settings
+local.properties
+
+# Secrets
+.env
+.env.*
+key.properties
+secrets.properties
+*.jks
+*.keystore
+*.pem
+*.p12
