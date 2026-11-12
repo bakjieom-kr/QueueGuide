@@ -4,16 +4,9 @@ import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Text
-import androidx.compose.material3.Button
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import ai.pleos.playground.navi.data.CurrentLocationInfo
 import ai.pleos.playground.navi.data.DestinationInfo
 import ai.pleos.playground.navi.data.RouteStateInfo
@@ -31,8 +24,21 @@ import android.os.SystemClock
 import androidx.activity.result.contract.ActivityResultContracts
 
 
-// 시연 후 제출용 APK에서는 false로 변경하세요.
+// true: 가상 주행 시연 / false: 실제 NaviHelper 경고 화면
 private const val ENABLE_DEMO = true
+
+// 72 km/h = 20 m/s: 가상 차량이 100m 이동할 때마다 5초 후 갱신한다.
+// 실제 NaviHelper/GPS의 속도 판단 함수는 변경하지 않는다.
+private const val DEMO_SPEED_KMH = 72.0
+private const val DEMO_METERS_PER_TICK = 100
+private const val DEMO_TICK_MILLIS = 5_000L
+private const val DEMO_STOP_MILLIS = 4_000L
+// 시작: 정체까지 900m, 분기점까지 1,300m / 정체 구간 길이 200m
+private const val DEMO_INITIAL_START_METERS = 900
+private const val DEMO_INITIAL_JUNCTION_METERS = 1_300
+private const val DEMO_ALERT_TRAVEL_METERS = 200  // 900 -> 800 -> 700m에서 경고 시작
+private const val DEMO_STOP_TRAVEL_METERS = 1_000 // 정체 구간 100m 진입 후 정차
+private const val DEMO_TOTAL_TRAVEL_METERS = 1_100
 
 class MainActivity : ComponentActivity() {
 
@@ -105,10 +111,13 @@ class MainActivity : ComponentActivity() {
     private val guideStatus = mutableStateOf("")
     private val warningActive = mutableStateOf(false)
 
-    // 실제 내비게이션 상태를 변경하지 않는 독립 시연 상태
-    private val demoStep = mutableStateOf(-1)
-    private val demoWarningActive = mutableStateOf(false)
-    private val demoStatus = mutableStateOf("")
+    // 실제 NaviHelper, GPS 및 경고 이력과 독립된 시연 상태
+    private val demoStep = mutableStateOf(0)
+    private val demoRunId = mutableStateOf(0)
+    private val demoUiState = mutableStateOf(demoQueueGuideUiState(0))
+
+    // Compose는 이 상태만 읽는다. 경고 발생/종료는 기존 비교 로직이 결정한다.
+    private val liveUiState = mutableStateOf(QueueGuideUiState())
 
 
     private val naviEventListener = object : NaviHelperEventListener {
@@ -147,9 +156,16 @@ class MainActivity : ComponentActivity() {
                     warnedTbt.clear()
                     activeWarning = null
                 }
-                hideWarning()
+                hideWarning(waitingForRoute = true)
                 Log.d("QueueGuideWarn", "ROUTE_RESET: 경로 데이터 및 경고 이력 초기화")
                 return
+            }
+
+            // 경로 안내가 시작되면 기본 화면으로 전환한다. 이미 경고가 켜졌다면 유지.
+            runOnUiThread {
+                if (!warningActive.value && liveUiState.value.phase == GuidePhase.WAITING) {
+                    liveUiState.value = QueueGuideUiState(phase = GuidePhase.NORMAL)
+                }
             }
 
             val sections = traffic?.congestionItemList.orEmpty()
@@ -232,7 +248,7 @@ class MainActivity : ComponentActivity() {
             if (hasPassedCongestion(active, destRemain)) {
                 Log.d("QueueGuideWarn", "WARN_UI_OFF: 정체 구간 통과, key=${active.key}")
                 activeWarning = null
-                hideWarning()
+                hideWarning(passedCongestion = true)
             } else {
                 showWarning(active, destRemain)
                 return
@@ -307,60 +323,129 @@ class MainActivity : ComponentActivity() {
                 "안내: ${active.label}"
     }
 
+    // SDK/시연 ActiveWarning을 동일한 UI 모델로 변환한다.
+    private fun toWarningUiState(
+        active: ActiveWarning,
+        destRemain: Double,
+        stopped: Boolean
+    ): QueueGuideUiState {
+        val traveled = (active.destinationRemainAtAlert - destRemain).coerceAtLeast(0.0)
+        val startLeft = (active.congestionStartAtAlert - traveled).coerceAtLeast(0.0)
+        val tbtLeft = (active.tbtDistanceAtAlert - traveled).coerceAtLeast(0.0)
+        val endLeft = (active.congestionEndAtAlert - traveled).coerceAtLeast(0.0)
+        val direction = when {
+            active.label.startsWith("TURN_LEFT") -> "좌회전"
+            active.label.startsWith("TURN_RIGHT") -> "우회전"
+            active.label.startsWith("TURN_UTURN") -> "유턴"
+            active.label.startsWith("TURN_STRAIGHT") -> "직진"
+            else -> "분기점 안내"
+        }
+        // 원본 TBT의 괄호 안 설명은 별도 추천 차로가 아닌 안내 문구로 사용한다.
+        val description = active.label.substringAfter('(', "").substringBeforeLast(')', "").trim()
+        val guide = if (description.isBlank()) direction else "$direction · $description"
+
+        return QueueGuideUiState(
+            phase = if (startLeft > 0.0) GuidePhase.APPROACH else GuidePhase.IN_CONGESTION,
+            congestionStartMeters = startLeft.toInt(),
+            congestionEndMeters = endLeft.toInt(),
+            junctionMeters = tbtLeft.toInt(),
+            junctionGuide = guide,
+            isStopped = stopped
+        )
+    }
+
     private fun showWarning(active: ActiveWarning, destRemain: Double) {
         val message = warningText(active, destRemain)
+        // 오래된 속도 샘플은 정차 판정에 사용하지 않는다.
+        val recentSpeed = latestSpeedKmh?.takeIf {
+            SystemClock.elapsedRealtime() - speedUpdatedAt <= 10_000L
+        }
+        val nextUiState = toWarningUiState(
+            active, destRemain, stopped = recentSpeed != null && recentSpeed <= 1.0
+        )
         runOnUiThread {
             warningActive.value = true
             guideStatus.value = message
+            liveUiState.value = nextUiState
         }
     }
 
-    // 시연: 일반 → 700m 접근 → 정체 진입 → 정차 → 통과 → 시연 종료
-    // 실제 NaviHelper/GPS 데이터 및 실제 경고 이력에는 영향을 주지 않는다.
-    private fun advanceDemo() {
-        val next = if (demoStep.value >= 4) -1 else demoStep.value + 1
-        demoStep.value = next
-
+    // 거리 기반 자동 시연: 일반 단계에서 900 -> 800m로 갱신한 뒤
+    // 700m에서 경고를 켠다 (72km/h 경고 기준 = 780m, 100m 단위 갱신).
+    // 정체 구간 길이 200m, 정체 진입 100m 후 4초 정차.
+    // 주의: 이는 GPS/NaviHelper가 아닌 시연용 가상 주행 데이터이다.
+    private fun updateDemoPosition(
+        traveledMeters: Int,
+        isStopped: Boolean = false,
+        stopWasShown: Boolean = false
+    ) {
+        // 200m 이동 후 700m에서 경고가 켜지므로 그 위치를 기준으로 잡는다.
         val mockWarning = ActiveWarning(
-            key = "DEMO_LEFT@1100",
-            label = "TURN_LEFT (판교역 방면)",
+            key = "DEMO_RIGHT@1100",
+            label = "TURN_RIGHT (종합운동장IC 방면)",
             congestionStartAtAlert = 700.0,
             congestionEndAtAlert = 900.0,
             tbtDistanceAtAlert = 1100.0,
             destinationRemainAtAlert = 2000.0
         )
 
-        val labels = listOf(
-            "일반: 정체 1,000m 전 (경고 기준 700m)",
-            "경고: 정체 시작까지 700m",
-            "정체 진입: 시작점 도달",
-            "정차: 위치 변화 없음",
-            "통과: 정체 종료점 1m 지나감"
-        )
-
-        val remain = when (next) {
-            1 -> 2000.0  // 경고 시작까지 700m
-            2, 3 -> 1300.0 // 정체 시작점 도달 및 정차
-            4 -> 1099.0  // 901m 이동, 정체 종료점(900m)을 통과
-            else -> 2000.0
+        val movedSinceAlert = (traveledMeters - DEMO_ALERT_TRAVEL_METERS).coerceAtLeast(0)
+        val remain = 2000.0 - movedSinceAlert
+        val passed = hasPassedCongestion(mockWarning, remain)
+        val startLeft = (DEMO_INITIAL_START_METERS - traveledMeters).coerceAtLeast(0)
+        val warningDistance = calculateWarningDistance(DEMO_SPEED_KMH)
+        val step = when {
+            passed -> 4
+            isStopped || stopWasShown -> 3
+            startLeft == 0 -> 2
+            shouldTriggerWarning(startLeft.toDouble(), warningDistance) -> 1
+            else -> 0
+        }
+        val visible = step in 1..3 && !passed
+        demoStep.value = step
+        demoUiState.value = when {
+            step == 0 -> QueueGuideUiState(
+                phase = GuidePhase.NORMAL,
+                congestionStartMeters = startLeft,
+                junctionMeters = (DEMO_INITIAL_JUNCTION_METERS - traveledMeters).coerceAtLeast(0),
+                junctionGuide = "우측 진출 · 종합운동장IC 방면"
+            )
+            passed -> QueueGuideUiState(
+                phase = GuidePhase.NORMAL,
+                notice = "정체 구간 통과",
+                junctionMeters = (DEMO_INITIAL_JUNCTION_METERS - traveledMeters).coerceAtLeast(0),
+                junctionGuide = "우측 진출 · 종합운동장IC 방면"
+            )
+            else -> toWarningUiState(mockWarning, remain, stopped = isStopped)
+                .copy(junctionGuide = "우측 진출 · 종합운동장IC 방면")
         }
 
-        val passed = hasPassedCongestion(mockWarning, remain)
-        val visible = next in 1..3 && !passed
-        demoWarningActive.value = visible
-        demoStatus.value = if (visible) warningText(mockWarning, remain) else ""
-
+        val endLeft = (DEMO_TOTAL_TRAVEL_METERS - traveledMeters).coerceAtLeast(0)
+        val junctionLeft = (DEMO_INITIAL_JUNCTION_METERS - traveledMeters).coerceAtLeast(0)
         Log.d(
             "QueueGuideDemo",
-            "STEP=$next, phase=${if (next < 0) "시연 종료" else labels[next]}, " +
+            "STEP=$step, traveled=${traveledMeters}m, " +
+                    "startLeft=${startLeft}m, endLeft=${endLeft}m, " +
+                    "tbtLeft=${junctionLeft}m, " +
+                    "speed=${if (isStopped) 0 else DEMO_SPEED_KMH.toInt()}km/h, " +
                     "UI=${if (visible) "ON" else "OFF"}, passed=$passed"
         )
     }
 
-    private fun hideWarning() {
+    private fun hideWarning(
+        waitingForRoute: Boolean = false,
+        passedCongestion: Boolean = false
+    ) {
         runOnUiThread {
             warningActive.value = false
             guideStatus.value = ""
+            liveUiState.value = when {
+                waitingForRoute -> QueueGuideUiState(phase = GuidePhase.WAITING)
+                passedCongestion -> QueueGuideUiState(
+                    phase = GuidePhase.NORMAL, notice = "정체 구간 통과"
+                )
+                else -> QueueGuideUiState(phase = GuidePhase.NORMAL)
+            }
         }
     }
 
@@ -405,45 +490,42 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         startSpeedTracking()
 
+
         setContent {
             QueueGuideTheme {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(24.dp)
-                ) {
-                    Text("QueueGuide")
-
-                    // 에뮬레이터 검증용 버튼. 배포 전 ENABLE_DEMO=false 처리.
-                    if (ENABLE_DEMO) {
-                        Spacer(Modifier.height(16.dp))
-                        Button(onClick = { advanceDemo() }) {
-                            Text(
-                                when (demoStep.value) {
-                                    -1 -> "시연 시작"
-                                    4 -> "시연 종료"
-                                    else -> "다음 단계"
-                                }
-                            )
-                        }
-                        if (demoStep.value >= 0) {
-                            val names = listOf("일반", "접근 경고", "정체 진입", "정차", "통과")
-                            Text("테스트 모드 · ${names[demoStep.value]}")
+                if (ENABLE_DEMO) {
+                    // 타이머는 단계 전환용이 아니라 100m씩 움직이는 가상 주행용이다.
+                    // 재시연 버튼을 누르면 runId가 바뀌어 이전 재생을 취소하고 재시작한다.
+                    val runId = demoRunId.value
+                    LaunchedEffect(runId) {
+                        updateDemoPosition(0)  // STEP 0: 900m, 1.3km
+                        for (distance in DEMO_METERS_PER_TICK..DEMO_TOTAL_TRAVEL_METERS step DEMO_METERS_PER_TICK) {
+                            delay(DEMO_TICK_MILLIS)  // 72km/h -> 100m / 5초
+                            if (distance == DEMO_STOP_TRAVEL_METERS) {
+                                // 정체 구간 100m 진입 후 정차, 위치와 거리 유지
+                                updateDemoPosition(distance, isStopped = true)
+                                delay(DEMO_STOP_MILLIS)
+                                // 재출발: 거리는 아직 그대로, 다음 이동은 5초 후
+                                updateDemoPosition(distance, stopWasShown = true)
+                            } else {
+                                updateDemoPosition(
+                                    distance,
+                                    stopWasShown = distance > DEMO_STOP_TRAVEL_METERS
+                                )
+                            }
                         }
                     }
-
-                    // 실제 경고 또는 독립 시연 중 하나만 표시
-                    val demoRunning = ENABLE_DEMO && demoStep.value >= 0
-                    val visible = if (demoRunning) demoWarningActive.value else warningActive.value
-                    val message = if (demoRunning) demoStatus.value else guideStatus.value
-                    if (visible) {
-                        Spacer(Modifier.height(24.dp))
-                        Text(message)
-                    }
-
+                    QueueGuideMapDemoScreen(
+                        state = demoUiState.value,
+                        demoStep = demoStep.value,
+                        onReplay = { demoRunId.value += 1 }
+                    )
+                } else {
+                    QueueGuideScreen(state = liveUiState.value)
                 }
             }
         }
+
 
         naviHelper = NaviHelper(applicationContext)
 

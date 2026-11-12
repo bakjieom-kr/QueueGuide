@@ -16,3 +16,6 @@ secrets.properties
 *.keystore
 *.pem
 *.p12
+
+# Android Studio settings
+.idea/
