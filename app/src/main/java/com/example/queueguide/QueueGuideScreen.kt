@@ -363,31 +363,33 @@ fun demoQueueGuideUiState(step: Int): QueueGuideUiState = when (step.coerceIn(0,
         phase = GuidePhase.NORMAL,
         congestionStartMeters = 900,
         junctionMeters = 1300,
-        junctionGuide = "좌회전 · 판교역 방면"
+        junctionGuide = "우회전 · 다음 교차로"
     )
     1 -> QueueGuideUiState(
         phase = GuidePhase.APPROACH,
         congestionStartMeters = 700,
         junctionMeters = 1100,
-        junctionGuide = "좌회전 · 판교역 방면"
+        junctionGuide = "우회전 · 다음 교차로"
     )
     2 -> QueueGuideUiState(
         phase = GuidePhase.IN_CONGESTION,
         congestionStartMeters = 0,
-        congestionEndMeters = 200,
+        congestionEndMeters = 400,
         junctionMeters = 400,
-        junctionGuide = "좌회전 · 판교역 방면"
+        junctionGuide = "우회전 · 다음 교차로"
     )
     3 -> QueueGuideUiState(
         phase = GuidePhase.IN_CONGESTION,
         congestionStartMeters = 0,
-        congestionEndMeters = 100,
+        congestionEndMeters = 300,
         junctionMeters = 300,
-        junctionGuide = "좌회전 · 판교역 방면",
+        junctionGuide = "우회전 · 다음 교차로",
         isStopped = true
     )
     else -> QueueGuideUiState(
         phase = GuidePhase.NORMAL,
-        notice = "정체 구간 통과"
+        notice = "정체 구간 통과",
+        junctionMeters = 0,
+        junctionGuide = "우회전 · 다음 교차로"
     )
 }

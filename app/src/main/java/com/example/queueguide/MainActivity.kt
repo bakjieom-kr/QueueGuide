@@ -27,18 +27,28 @@ import androidx.activity.result.contract.ActivityResultContracts
 // true: 가상 주행 시연 / false: 실제 NaviHelper 경고 화면
 private const val ENABLE_DEMO = true
 
-// 72 km/h = 20 m/s: 가상 차량이 100m 이동할 때마다 5초 후 갱신한다.
-// 실제 NaviHelper/GPS의 속도 판단 함수는 변경하지 않는다.
-private const val DEMO_SPEED_KMH = 72.0
+// 도심 정체 시연용 속도: 거리별 감속, 정차, 재출발을 표현한다.
+// 재생 시간은 약 4배속으로 압축하며 실제 SDK/GPS 속도 처리는 변경하지 않는다.
 private const val DEMO_METERS_PER_TICK = 100
-private const val DEMO_TICK_MILLIS = 5_000L
+private const val DEMO_PLAYBACK_MULTIPLIER = 4.0
 private const val DEMO_STOP_MILLIS = 4_000L
-// 시작: 정체까지 900m, 분기점까지 1,300m / 정체 구간 길이 200m
+// 시연: 정체 시작점 900m, 우회전 교차로 1,300m / 정체 구간 400m
 private const val DEMO_INITIAL_START_METERS = 900
 private const val DEMO_INITIAL_JUNCTION_METERS = 1_300
 private const val DEMO_ALERT_TRAVEL_METERS = 200  // 900 -> 800 -> 700m에서 경고 시작
 private const val DEMO_STOP_TRAVEL_METERS = 1_000 // 정체 구간 100m 진입 후 정차
-private const val DEMO_TOTAL_TRAVEL_METERS = 1_100
+private const val DEMO_TOTAL_TRAVEL_METERS = 1_300
+
+/** 시연에만 사용하는 예시 속도(km/h). 실제 NaviHelper 차량 속도와 무관. */
+internal fun demoSpeedKmhAt(traveledMeters: Int, isStopped: Boolean = false): Int = when {
+    isStopped -> 0
+    traveledMeters < 800 -> 72      // 일반 주행
+    traveledMeters < 900 -> 45      // 정체 시작점 접근
+    traveledMeters < 1000 -> 25     // 정체 구간 진입
+    traveledMeters < 1100 -> 12     // 정차 전후 서행 및 재출발
+    traveledMeters < 1200 -> 15     // 서행
+    else -> 20                     // 교차로 접근
+}
 
 class MainActivity : ComponentActivity() {
 
@@ -371,20 +381,20 @@ class MainActivity : ComponentActivity() {
     }
 
     // 거리 기반 자동 시연: 일반 단계에서 900 -> 800m로 갱신한 뒤
-    // 700m에서 경고를 켠다 (72km/h 경고 기준 = 780m, 100m 단위 갱신).
-    // 정체 구간 길이 200m, 정체 진입 100m 후 4초 정차.
+    // 700m에서 경고를 켠다 (초기 72km/h 경고 기준 = 780m, 100m 단위 갱신).
+    // 정체 구간 길이 400m, 정체 진입 100m 후 4초 정차.
     // 주의: 이는 GPS/NaviHelper가 아닌 시연용 가상 주행 데이터이다.
     private fun updateDemoPosition(
         traveledMeters: Int,
         isStopped: Boolean = false,
         stopWasShown: Boolean = false
     ) {
-        // 200m 이동 후 700m에서 경고가 켜지므로 그 위치를 기준으로 잡는다.
+        // 출발 후 200m 이동한 지점(정체 시작까지 700m)에서 경고가 켜진다.
         val mockWarning = ActiveWarning(
-            key = "DEMO_RIGHT@1100",
-            label = "TURN_RIGHT (종합운동장IC 방면)",
+            key = "DEMO_CITY_RIGHT@1100",
+            label = "TURN_RIGHT (다음 교차로)",
             congestionStartAtAlert = 700.0,
-            congestionEndAtAlert = 900.0,
+            congestionEndAtAlert = 1100.0,
             tbtDistanceAtAlert = 1100.0,
             destinationRemainAtAlert = 2000.0
         )
@@ -393,7 +403,9 @@ class MainActivity : ComponentActivity() {
         val remain = 2000.0 - movedSinceAlert
         val passed = hasPassedCongestion(mockWarning, remain)
         val startLeft = (DEMO_INITIAL_START_METERS - traveledMeters).coerceAtLeast(0)
-        val warningDistance = calculateWarningDistance(DEMO_SPEED_KMH)
+        val demoSpeed = demoSpeedKmhAt(traveledMeters, isStopped)
+        val warningDistance = calculateWarningDistance(demoSpeed.toDouble())
+        // 정차 후에는 STEP 3을 재출발 상태로 유지해 진행 단계가 역행하지 않게 한다.
         val step = when {
             passed -> 4
             isStopped || stopWasShown -> 3
@@ -408,16 +420,16 @@ class MainActivity : ComponentActivity() {
                 phase = GuidePhase.NORMAL,
                 congestionStartMeters = startLeft,
                 junctionMeters = (DEMO_INITIAL_JUNCTION_METERS - traveledMeters).coerceAtLeast(0),
-                junctionGuide = "우측 진출 · 종합운동장IC 방면"
+                junctionGuide = "우회전 · 다음 교차로"
             )
             passed -> QueueGuideUiState(
                 phase = GuidePhase.NORMAL,
                 notice = "정체 구간 통과",
                 junctionMeters = (DEMO_INITIAL_JUNCTION_METERS - traveledMeters).coerceAtLeast(0),
-                junctionGuide = "우측 진출 · 종합운동장IC 방면"
+                junctionGuide = "우회전 · 다음 교차로"
             )
             else -> toWarningUiState(mockWarning, remain, stopped = isStopped)
-                .copy(junctionGuide = "우측 진출 · 종합운동장IC 방면")
+                .copy(junctionGuide = "우회전 · 다음 교차로")
         }
 
         val endLeft = (DEMO_TOTAL_TRAVEL_METERS - traveledMeters).coerceAtLeast(0)
@@ -427,7 +439,7 @@ class MainActivity : ComponentActivity() {
             "STEP=$step, traveled=${traveledMeters}m, " +
                     "startLeft=${startLeft}m, endLeft=${endLeft}m, " +
                     "tbtLeft=${junctionLeft}m, " +
-                    "speed=${if (isStopped) 0 else DEMO_SPEED_KMH.toInt()}km/h, " +
+                    "speed=${if (passed) 0 else demoSpeed}km/h, " +
                     "UI=${if (visible) "ON" else "OFF"}, passed=$passed"
         )
     }
@@ -500,12 +512,19 @@ class MainActivity : ComponentActivity() {
                     LaunchedEffect(runId) {
                         updateDemoPosition(0)  // STEP 0: 900m, 1.3km
                         for (distance in DEMO_METERS_PER_TICK..DEMO_TOTAL_TRAVEL_METERS step DEMO_METERS_PER_TICK) {
-                            delay(DEMO_TICK_MILLIS)  // 72km/h -> 100m / 5초
+                            // 100m 이동 시간을 해당 구간의 가상 속도로 계산해 4배속 재생.
+                            val midPoint = distance - DEMO_METERS_PER_TICK / 2
+                            val segmentSpeedKmh = demoSpeedKmhAt(midPoint)
+                            val travelMillis = (
+                                    DEMO_METERS_PER_TICK * 3.6 * 1000.0 /
+                                            segmentSpeedKmh / DEMO_PLAYBACK_MULTIPLIER
+                                    ).toLong().coerceAtLeast(800L)
+                            delay(travelMillis)
                             if (distance == DEMO_STOP_TRAVEL_METERS) {
                                 // 정체 구간 100m 진입 후 정차, 위치와 거리 유지
                                 updateDemoPosition(distance, isStopped = true)
                                 delay(DEMO_STOP_MILLIS)
-                                // 재출발: 거리는 아직 그대로, 다음 이동은 5초 후
+                                // 재출발: 같은 위치에서 속도만 복구하고 다음 이동시간은 서행속도를 반영
                                 updateDemoPosition(distance, stopWasShown = true)
                             } else {
                                 updateDemoPosition(
@@ -657,4 +676,3 @@ fun shouldEmitWarning(
 
     return warnedKeys.add(key)
 }
-

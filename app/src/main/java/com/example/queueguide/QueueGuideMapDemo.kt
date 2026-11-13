@@ -335,7 +335,12 @@ private fun CityTurnSidePanel(
                     fontWeight = FontWeight.ExtraBold, color = Ink)
                 Text("도심 교차로 정체 사전 안내", fontSize = 13.sp, color = Muted)
             }
-            Text("DEMO · ${if (state.isStopped || passed) 0 else 72} km/h",
+            // MainActivity의 시연 거리와 동일한 속도 프로필을 사용한다.
+            val traveledMeters = (
+                    MAP_JUNCTION_DISTANCE - (state.junctionMeters ?: MAP_JUNCTION_DISTANCE)
+                    ).coerceIn(0, MAP_JUNCTION_DISTANCE)
+            val demoSpeed = if (passed) 0 else demoSpeedKmhAt(traveledMeters, state.isStopped)
+            Text(if (passed) "DEMO · 완료" else "DEMO · $demoSpeed km/h · 4배속",
                 color = Muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
 
@@ -416,7 +421,9 @@ private fun CityTurnSidePanel(
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            listOf("일반", "접근", "진입", "정차", "통과").forEachIndexed { index, item ->
+            // STEP 3: 정차 중에는 "정차", 재출발 후에는 "재출발"로 표기한다.
+            listOf("일반", "접근", "진입", "정차", "통과").forEachIndexed { index, label ->
+                val item = if (index == 3 && step == 3 && !state.isStopped) "재출발" else label
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                     Box(
                         Modifier.fillMaxWidth().height(6.dp).background(
